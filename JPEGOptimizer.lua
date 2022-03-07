@@ -34,7 +34,7 @@ local LrFileUtils = import'LrFileUtils'
 local LrLogger = import 'LrLogger'
 
 local logger = LrLogger('JPEGOptimizer')
-logger:enable("print")
+logger:enable("logfile")
 
 quote4Win = function (cmd)
 	if (WIN_ENV) then return '"' .. cmd .. '"' else return cmd end
@@ -51,10 +51,22 @@ ObserveFTJO_StripMetadata = function (propertyTable)
 	if(propertyTable.FTJO_StripMetadata) then propertyTable.FTJO_RemovePreview = false end
 end
 ObserveMOZJ_Recompress = function (propertyTable)
-	if(propertyTable.MOZJ_Recompress) then propertyTable.FTJO_Recompress = false end
+	if(propertyTable.MOZJ_Recompress) then
+		propertyTable.FTJO_Recompress = false
+		propertyTable.JPEGXL_Recompress = false
+	end
 end
 ObserveFTJO_Recompress = function (propertyTable)
-	if(propertyTable.FTJO_Recompress) then propertyTable.MOZJ_Recompress = false end
+	if(propertyTable.FTJO_Recompress) then
+		propertyTable.JPEGXL_Recompress = false
+		propertyTable.MOZJ_Recompress = false
+	end
+end
+ObserveJPEGXL_Recompress = function (propertyTable)
+	if(propertyTable.JPEGXL_Recompress) then
+		propertyTable.FTJO_Recompress = false
+		propertyTable.MOZJ_Recompress = false
+	end
 end
 
 return {
@@ -66,11 +78,13 @@ return {
 		{key = 'FTJO_JRCQuality', default = 'medium'},
 		{key = 'FTJO_JRCMethod', default = 'smallfry'},
 		{key = 'FTJO_JRCSubsampling', default = true},
+		{key = 'JPEGXL_Recompress', default = false},
 		{key = 'MOZJ_Recompress', default = false}
 	},
 	sectionForFilterInDialog = function(viewFactory, propertyTable)
 		propertyTable:addObserver('FTJO_RemovePreview', ObserveFTJO_RemovePreview)
 		propertyTable:addObserver('FTJO_StripMetadata', ObserveFTJO_StripMetadata)
+		propertyTable:addObserver('JPEGXL_Recompress', ObserveJPEGXL_Recompress)
 		propertyTable:addObserver('MOZJ_Recompress', ObserveMOZJ_Recompress)
 		propertyTable:addObserver('FTJO_Recompress', ObserveFTJO_Recompress)
 		return {
@@ -120,6 +134,15 @@ return {
 								text_color = LrColor( 0, 0, 1 )
 							}
 						}
+					},
+					viewFactory:group_box {
+						title = 'JPEG XL Recompression',
+						viewFactory:checkbox {
+							title = 'Recompress JPEG',
+							value = LrView.bind 'JPEGXL_Recompress',
+							checked_value = true,
+							unchecked_value = false,
+						},
 					},
 					viewFactory:group_box {
 						title = 'MozJPEG Recompression',
@@ -216,12 +239,16 @@ return {
 		local UPjpegrecompress = 'jpeg-archive'
 		local UPjpegtran = 'mozjpeg'
 		local UPcjpeg = 'mozjpeg'
+		local UPcjxl = 'jxl'
+
 		-- Define executable names for external tools
 		local UEexiv2 = 'exiv2' .. (WIN_ENV and '.exe' or '')
 		local UEImageMagick = MAC_ENV and 'convert' or 'magick.exe'
 		local UEjpegrecompress = 'jpeg-recompress' .. (WIN_ENV and '.exe' or '')
 		local UEjpegtran = 'jpegtran' .. (WIN_ENV and '.exe' or '')
 		local UEcjpeg = 'cjpeg' .. (WIN_ENV and '.exe' or '')
+		local UEcjxl = 'cjxl' .. (WIN_ENV and '.exe' or '')
+
 		-- Define platform-specific path for external tools
 		local PlatPath = MAC_ENV and 'macOS' or 'WIN'
 		-- Construct commands for external tools (reusing path variables)
@@ -235,10 +262,15 @@ return {
 		UPjpegrecompress = '"' .. LrPathUtils.child(LrPathUtils.child(LrPathUtils.child(_PLUGIN.path, PlatPath), UPjpegrecompress), UEjpegrecompress) .. '"'
 		UPjpegtran = '"' .. LrPathUtils.child(LrPathUtils.child(LrPathUtils.child(_PLUGIN.path, PlatPath), UPjpegtran), UEjpegtran) .. '"'
 		UPcjpeg = '"' .. LrPathUtils.child(LrPathUtils.child(LrPathUtils.child(_PLUGIN.path, PlatPath), UPcjpeg), UEcjpeg) .. '"'
+		UPcjxl = '"' .. LrPathUtils.child(LrPathUtils.child(LrPathUtils.child(_PLUGIN.path, PlatPath), UPcjxl), UEcjxl) .. '"'
 
 		local renditionOptions = {
 			filterSettings = function( renditionToSatisfy, exportSettings )
-				if filterContext.propertyTable.FTJO_Recompress then
+				if filterContext.propertyTable.JPEGXL_Recompress then
+					exportSettings.LR_format = 'PNG'
+					exportSettings.LR_export_colorSpace = 'sRGB'
+					exportSettings.LR_export_bitDepth = '16'
+				elseif filterContext.propertyTable.FTJO_Recompress then
 					exportSettings.LR_format = 'TIFF'
 					exportSettings.LR_export_colorSpace = 'sRGB'
 					exportSettings.LR_export_bitDepth = '8'
@@ -254,13 +286,30 @@ return {
 		for sourceRendition, renditionToSatisfy in filterContext:renditions(renditionOptions) do
 			local success, pathOrMessage = sourceRendition:waitForRender()
 			if success then
-				if filterContext.propertyTable.LR_format ~= 'JPEG' and not (filterContext.propertyTable.FTJO_Recompress or filterContext.propertyTable.MOZJ_Recompress) then
+				if filterContext.propertyTable.LR_format ~= 'JPEG' and not (filterContext.propertyTable.FTJO_Recompress or filterContext.propertyTable.JPEGXL_Recompress or filterContext.propertyTable.MOZJ_Recompress) then
 					renditionToSatisfy:renditionIsDone(false, 'Lossless optimizations only work on JPEG files. Please check the image format settings or activate recompression.')
 					break
 				end
 
 				local ExpFileName = LrPathUtils.standardizePath(pathOrMessage)
-				if filterContext.propertyTable.MOZJ_Recompress then
+				if filterContext.propertyTable.JPEGXL_Recompress then
+					if not filterContext.propertyTable.FTJO_StripMetadata then
+						local CmdDumpMetadata = UPexiv2 .. ' -q -f -eX "' .. ExpFileName .. '"'
+						outputToLog('Dump metadata: ' .. CmdDumpMetadata)
+						if LrTasks.execute(quote4Win(CmdDumpMetadata)) ~= 0 then renditionToSatisfy:renditionIsDone(false, 'Error exporting XMP data.') end
+						if not filterContext.propertyTable.FTJO_RemovePreview then
+							local CmdRenderPreview = UPImageMagick .. ' "' .. ExpFileName .. '" -resize 256x256 ppm:- | ' .. UPjpegrecompress .. ' --quiet --no-progressive --method smallfry --quality low --strip --ppm - "' .. LrPathUtils.removeExtension(ExpFileName) .. '-thumb.jpg"'
+							outputToLog('Render preview: ' .. CmdRenderPreview)
+							if LrTasks.execute(quote4Win(CmdRenderPreview)) ~= 0 then renditionToSatisfy:renditionIsDone(false, 'Error creating EXIF thumbnail.') end
+						end
+					end
+					local CmdRecompress = UPcjxl .. ' "' .. ExpFileName .. '" "' .. ExpFileName .. '.tmp" -q 80 -e 9'
+					if filterContext.propertyTable.FTJO_Progressive then CmdRecompress = CmdRecompress .. ' -p' end
+					outputToLog('Recompress: ' .. CmdRecompress)
+					if LrTasks.execute(quote4Win(CmdRecompress)) ~= 0 then renditionToSatisfy:renditionIsDone(false, 'Error recompressing JPEG XL file: ' .. CmdRecompress) end
+					LrFileUtils.delete(ExpFileName)
+					LrFileUtils.move(ExpFileName .. '.tmp', ExpFileName)
+				elseif filterContext.propertyTable.MOZJ_Recompress then
 					if not filterContext.propertyTable.FTJO_StripMetadata then
 						local CmdDumpMetadata = UPexiv2 .. ' -q -f -eX "' .. ExpFileName .. '"'
 						outputToLog('Dump metadata: ' .. CmdDumpMetadata)
@@ -275,7 +324,7 @@ return {
 					if not filterContext.propertyTable.FTJO_Progressive then CmdRecompress = CmdRecompress .. ' -baseline' end
 					CmdRecompress = CmdRecompress .. ' "' .. ExpFileName .. '"'
 					outputToLog('Recompress: ' .. CmdRecompress)
-					if LrTasks.execute(quote4Win(CmdRecompress)) ~= 0 then renditionToSatisfy:renditionIsDone(false, 'Error recompressing JPEG file.') end
+					if LrTasks.execute(quote4Win(CmdRecompress)) ~= 0 then renditionToSatisfy:renditionIsDone(false, 'Error recompressing MozJPEG JPEG file.') end
 					LrFileUtils.delete(ExpFileName)
 					LrFileUtils.move(ExpFileName .. '.tmp', ExpFileName)
 					if not filterContext.propertyTable.FTJO_StripMetadata then
