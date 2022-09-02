@@ -144,19 +144,31 @@ RecompressFile = function (functionContext, filterContext, sourceRendition, rend
 					end
 				end
 
-				local CmdRecompress = UPcjpeg .. ' -outfile "' .. ExpFileName .. '"'
-				if not filterContext.propertyTable.FTJO_Progressive then CmdRecompress = CmdRecompress .. ' -baseline' end
-				CmdRecompress = CmdRecompress .. ' "' .. renderFileName .. '"'
-				outputToLog('Recompress: ' .. CmdRecompress)
-				if LrTasks.execute(quote4Win(CmdRecompress)) ~= 0 then
-					renditionToSatisfy:renditionIsDone(false, 'Error recompressing MozJPEG JPEG file.')
+				local CmdCreatePNG = UPImageMagick .. ' convert "' .. renderFileName .. '" -define png:compression-level=0 -define png:compression-filter=0 -define png:compression-strategy=0 "' .. renderFileName .. '.png"'
+				outputToLog('TIFF -> PNG: ' .. CmdCreatePNG)
+				if LrTasks.execute(quote4Win(CmdCreatePNG)) ~= 0 then
+					renditionToSatisfy:renditionIsDone(false, 'Error converting TIFF to PNG file.')
 					LrFileUtils.delete(renderFileName)
-					LrFileUtils.delete(ExpFileName)
+					LrFileUtils.delete(renderFileName .. '.png')
 					LrFileUtils.delete(LrPathUtils.replaceExtension(ExpFileName, 'xmp'))
 					LrFileUtils.delete(LrPathUtils.removeExtension(ExpFileName) ..'-thumb.jpg')
 					return false
 				end
 				LrFileUtils.delete(renderFileName)
+
+				local CmdRecompress = UPcjpeg .. ' -outfile "' .. ExpFileName .. '"'
+				if not filterContext.propertyTable.FTJO_Progressive then CmdRecompress = CmdRecompress .. ' -baseline' end
+				CmdRecompress = CmdRecompress .. ' "' .. renderFileName .. '.png"'
+				outputToLog('PNG -> JPEG: ' .. CmdRecompress)
+				if LrTasks.execute(quote4Win(CmdRecompress)) ~= 0 then
+					renditionToSatisfy:renditionIsDone(false, 'Error creating MozJPEG JPEG file from PNG.')
+          LrFileUtils.delete(renderFileName .. '.png')
+					LrFileUtils.delete(ExpFileName)
+					LrFileUtils.delete(LrPathUtils.replaceExtension(ExpFileName, 'xmp'))
+					LrFileUtils.delete(LrPathUtils.removeExtension(ExpFileName) ..'-thumb.jpg')
+					return false
+				end
+				LrFileUtils.delete(renderFileName .. '.png')
 
 				if not filterContext.propertyTable.FTJO_StripMetadata then
 					local CmdInsertMetadata = UPexiv2 .. ' -q -f -iX "' .. ExpFileName .. '"' .. (MAC_ENV and ' 2>/dev/null' or ' 2>nul')
@@ -462,15 +474,18 @@ return {
 						exportSettings.LR_format = 'TIFF'
 						exportSettings.LR_export_colorSpace = 'sRGB'
 						exportSettings.LR_export_bitDepth = '8'
+						exportSettings.LR_tiff_compressionMethod = 'compressionMethod_None'
 						exportSettings.LRtiff_compressionMethod = 'compressionMethod_None'
 						return LrPathUtils.removeExtension(renditionToSatisfy.destinationPath) .. '-' .. os.time() .. '-FTJO.tif'
 					elseif filterContext.propertyTable.MOZJ_Recompress then
-						outputToLog('Rendering PNG sRGB 8bpp for MozJPEG')
+						outputToLog('Rendering TIFF sRGB 16bpp for MozJPEG')
 						renditionToSatisfy.recompress = true
-						exportSettings.LR_format = 'PNG'
+						exportSettings.LR_format = 'TIFF'
 						exportSettings.LR_export_colorSpace = 'sRGB'
-						exportSettings.LR_export_bitDepth = '8'
-						return LrPathUtils.removeExtension(renditionToSatisfy.destinationPath) .. '-' .. os.time() .. '-MOZJ.png'
+						exportSettings.LR_export_bitDepth = '16'
+						exportSettings.LR_tiff_compressionMethod = 'compressionMethod_None'
+						exportSettings.LRtiff_compressionMethod = 'compressionMethod_None'
+						return LrPathUtils.removeExtension(renditionToSatisfy.destinationPath) .. '-' .. os.time() .. '-MOZJ.tif'
 					else
 						outputToLog('Not modifying rendering, recompression not selected')
 					end
