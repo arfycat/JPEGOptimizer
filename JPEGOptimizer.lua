@@ -75,7 +75,6 @@ UPjpegtran = '"' .. LrPathUtils.child(LrPathUtils.child(LrPathUtils.child(_PLUGI
 UPcjpeg = '"' .. LrPathUtils.child(LrPathUtils.child(LrPathUtils.child(_PLUGIN.path, PlatPath), UPcjpeg), UEcjpeg) .. '"'
 UPcjxl = '"' .. LrPathUtils.child(LrPathUtils.child(LrPathUtils.child(_PLUGIN.path, PlatPath), UPcjxl), UEcjxl) .. '"'
 
-
 ObserveFTJO_RemovePreview = function (propertyTable)
 	if(propertyTable.FTJO_RemovePreview) then propertyTable.FTJO_StripMetadata = false end
 end
@@ -104,10 +103,20 @@ end
 RecompressFile = function (functionContext, filterContext, sourceRendition, renditionToSatisfy)
 	local success, pathOrMessage = sourceRendition:waitForRender()
 	if success then
+
+    if LrTasks.execute(UEImageMagick .. ' -version') == 0 then
+      UPImageMagick = UEImageMagick
+    end
+
 		if renditionToSatisfy.recompress then
 			local renderFileName = LrPathUtils.standardizePath(pathOrMessage) -- Rendered file
 			local ExpFileName = LrPathUtils.standardizePath(renditionToSatisfy.destinationPath) -- Final exported file
-			outputToLog(renderFileName .. ' -> ' .. ExpFileName)
+			outputToLog('')
+			outputToLog('Lightroom render: ' .. renderFileName)
+      local InFileAttr =  LrFileUtils.fileAttributes(renderFileName)
+      if InFileAttr['fileSize'] ~= nil then
+        outputToLog('  ' .. renderFileName .. ': ' .. InFileAttr['fileSize'])
+      end
 
 			if filterContext.propertyTable.JPEGXL_Recompress then
 				local CmdRecompress = UPcjxl .. ' "' .. renderFileName .. '" "' .. ExpFileName .. '" -q 90 -e 9'
@@ -131,6 +140,7 @@ RecompressFile = function (functionContext, filterContext, sourceRendition, rend
 						return false
 					end
 					LrFileUtils.move(LrPathUtils.replaceExtension(renderFileName, 'xmp'), LrPathUtils.replaceExtension(ExpFileName, 'xmp'))
+
 					if not filterContext.propertyTable.FTJO_RemovePreview then
 						local CmdRenderPreview = UPImageMagick .. ' "' .. renderFileName .. '" -resize 256x256 ppm:- | ' .. UPjpegrecompress .. ' --quiet --no-progressive --method smallfry --quality low --strip --ppm - "' .. LrPathUtils.removeExtension(ExpFileName) .. '-thumb.jpg"'
 						outputToLog('Render preview: ' .. CmdRenderPreview)
@@ -144,31 +154,38 @@ RecompressFile = function (functionContext, filterContext, sourceRendition, rend
 					end
 				end
 
-				local CmdCreatePNG = UPImageMagick .. ' convert "' .. renderFileName .. '" -define png:compression-level=0 -define png:compression-filter=0 -define png:compression-strategy=0 "' .. renderFileName .. '.png"'
-				outputToLog('TIFF -> PNG: ' .. CmdCreatePNG)
-				if LrTasks.execute(quote4Win(CmdCreatePNG)) ~= 0 then
-					renditionToSatisfy:renditionIsDone(false, 'Error converting TIFF to PNG file.')
-					LrFileUtils.delete(renderFileName)
-					LrFileUtils.delete(renderFileName .. '.png')
-					LrFileUtils.delete(LrPathUtils.replaceExtension(ExpFileName, 'xmp'))
-					LrFileUtils.delete(LrPathUtils.removeExtension(ExpFileName) ..'-thumb.jpg')
-					return false
-				end
-				LrFileUtils.delete(renderFileName)
+        if filterContext.propertyTable.MOZJ_UseTIFF then
+          local CmdCreatePNG = UPImageMagick .. ' convert "' .. renderFileName .. '" -define png:compression-level=0 -define png:compression-filter=0 -define png:compression-strategy=0 -colorspace sRGB "' .. renderFileName .. '.png"'
+          outputToLog('-> PNG: ' .. CmdCreatePNG)
+          if LrTasks.execute(quote4Win(CmdCreatePNG)) ~= 0 then
+            renditionToSatisfy:renditionIsDone(false, 'Error converting TIFF to PNG file.')
+            LrFileUtils.delete(renderFileName)
+            LrFileUtils.delete(renderFileName .. '.png')
+            LrFileUtils.delete(LrPathUtils.replaceExtension(ExpFileName, 'xmp'))
+            LrFileUtils.delete(LrPathUtils.removeExtension(ExpFileName) ..'-thumb.jpg')
+            return false
+          end
+          local PNGAttr =  LrFileUtils.fileAttributes(renderFileName .. '.png')
+          if PNGAttr['fileSize'] ~= nil then
+            outputToLog('  ' .. renderFileName .. '.png: ' .. PNGAttr['fileSize'])
+          end
+          LrFileUtils.delete(renderFileName)
+          renderFileName = renderFileName .. '.png'
+        end
 
 				local CmdRecompress = UPcjpeg .. ' -outfile "' .. ExpFileName .. '"'
 				if not filterContext.propertyTable.FTJO_Progressive then CmdRecompress = CmdRecompress .. ' -baseline' end
-				CmdRecompress = CmdRecompress .. ' "' .. renderFileName .. '.png"'
-				outputToLog('PNG -> JPEG: ' .. CmdRecompress)
+				CmdRecompress = CmdRecompress .. ' "' .. renderFileName
+				outputToLog('-> JPEG: ' .. CmdRecompress)
 				if LrTasks.execute(quote4Win(CmdRecompress)) ~= 0 then
 					renditionToSatisfy:renditionIsDone(false, 'Error creating MozJPEG JPEG file from PNG.')
-          LrFileUtils.delete(renderFileName .. '.png')
+          LrFileUtils.delete(renderFileName)
 					LrFileUtils.delete(ExpFileName)
 					LrFileUtils.delete(LrPathUtils.replaceExtension(ExpFileName, 'xmp'))
 					LrFileUtils.delete(LrPathUtils.removeExtension(ExpFileName) ..'-thumb.jpg')
 					return false
 				end
-				LrFileUtils.delete(renderFileName .. '.png')
+				LrFileUtils.delete(renderFileName)
 
 				if not filterContext.propertyTable.FTJO_StripMetadata then
 					local CmdInsertMetadata = UPexiv2 .. ' -q -f -iX "' .. ExpFileName .. '"' .. (MAC_ENV and ' 2>/dev/null' or ' 2>nul')
@@ -195,6 +212,10 @@ RecompressFile = function (functionContext, filterContext, sourceRendition, rend
 					end
 				end
 				LrFileUtils.delete(renderFileName)
+        local ExpAttr =  LrFileUtils.fileAttributes(ExpFileName)
+        if ExpAttr['fileSize'] ~= nil then
+          outputToLog('  ' .. ExpFileName .. ': ' .. ExpAttr['fileSize'])
+        end
 			elseif filterContext.propertyTable.FTJO_Recompress then
 				if not filterContext.propertyTable.FTJO_StripMetadata then
 					local CmdDumpMetadata = UPexiv2 .. ' -q -f -eX "' .. renderFileName .. '"'
@@ -284,6 +305,7 @@ RecompressFile = function (functionContext, filterContext, sourceRendition, rend
 				end
 			end
 		end
+    renditionToSatisfy:renditionIsDone(true)
 	else
 		renditionToSatisfy:renditionIsDone(false, pathOrMessage)
 		return false
@@ -302,7 +324,8 @@ return {
 		{key = 'FTJO_JRCMethod', default = 'smallfry'},
 		{key = 'FTJO_JRCSubsampling', default = true},
 		{key = 'JPEGXL_Recompress', default = false},
-		{key = 'MOZJ_Recompress', default = false}
+		{key = 'MOZJ_Recompress', default = false},
+		{key = 'MOZJ_UseTIFF', default = false}
 	},
 	sectionForFilterInDialog = function(viewFactory, propertyTable)
 		propertyTable:addObserver('FTJO_RemovePreview', ObserveFTJO_RemovePreview)
@@ -372,6 +395,13 @@ return {
 						viewFactory:checkbox {
 							title = 'Recompress JPEG',
 							value = LrView.bind 'MOZJ_Recompress',
+							checked_value = true,
+							unchecked_value = false,
+						},
+						viewFactory:checkbox {
+							value = LrView.bind 'MOZJ_Recompress',
+							title = 'Use TIFF',
+							value = LrView.bind 'MOZJ_UseTIFF',
 							checked_value = true,
 							unchecked_value = false,
 						},
@@ -457,7 +487,7 @@ return {
 	postProcessRenderedPhotos = function(functionContext, filterContext)
 		local renditionOptions = {
 			filterSettings = function( renditionToSatisfy, exportSettings )
-				outputToLog('Output file: ' .. renditionToSatisfy.destinationPath)
+				outputToLog('Final output file: ' .. renditionToSatisfy.destinationPath)
 				renditionToSatisfy.recompress = false
 
 				if renditionToSatisfy.destinationPath:match('\.[Jj][Pp][Gg]$') then
@@ -466,26 +496,34 @@ return {
 						renditionToSatisfy.recompress = true
 						exportSettings.LR_format = 'PNG'
 						exportSettings.LR_export_colorSpace = 'sRGB'
-						exportSettings.LR_export_bitDepth = '16'
+						exportSettings.LR_export_bitDepth = 16
 						return LrPathUtils.removeExtension(renditionToSatisfy.destinationPath) .. '-' .. os.time() .. '-JPEGXL.png'
 					elseif filterContext.propertyTable.FTJO_Recompress then
 						outputToLog('Rendering TIFF sRGB 8bpp')
 						renditionToSatisfy.recompress = true
 						exportSettings.LR_format = 'TIFF'
 						exportSettings.LR_export_colorSpace = 'sRGB'
-						exportSettings.LR_export_bitDepth = '8'
-						exportSettings.LR_tiff_compressionMethod = 'compressionMethod_None'
-						exportSettings.LRtiff_compressionMethod = 'compressionMethod_None'
+						exportSettings.LR_export_bitDepth = 8
+            exportSettings.LR_tiff_compressionMethod = 'compressionMethod_None'
 						return LrPathUtils.removeExtension(renditionToSatisfy.destinationPath) .. '-' .. os.time() .. '-FTJO.tif'
 					elseif filterContext.propertyTable.MOZJ_Recompress then
-						outputToLog('Rendering TIFF sRGB 16bpp for MozJPEG')
 						renditionToSatisfy.recompress = true
-						exportSettings.LR_format = 'TIFF'
-						exportSettings.LR_export_colorSpace = 'sRGB'
-						exportSettings.LR_export_bitDepth = '16'
-						exportSettings.LR_tiff_compressionMethod = 'compressionMethod_None'
-						exportSettings.LRtiff_compressionMethod = 'compressionMethod_None'
-						return LrPathUtils.removeExtension(renditionToSatisfy.destinationPath) .. '-' .. os.time() .. '-MOZJ.tif'
+            if filterContext.propertyTable.MOZJ_UseTIFF then
+              outputToLog('Rendering TIFF sRGB 8bpp for MozJPEG')
+              exportSettings.LR_format = 'TIFF'
+              exportSettings.LR_export_colorSpace = 'sRGB'
+              exportSettings.LR_export_bitDepth = 8
+              exportSettings.LR_tiff_compressionMethod = 'compressionMethod_None'
+              return LrPathUtils.removeExtension(renditionToSatisfy.destinationPath) .. '-' .. os.time() .. '-MOZJ.tif'
+            else
+              outputToLog('Rendering JPEG sRGB 8bpp for MozJPEG')
+              exportSettings.LR_format = 'JPEG'
+              exportSettings.LR_export_colorSpace = 'sRGB'
+              exportSettings.LR_export_bitDepth = 8
+              exportSettings.LR_jpeg_quality = 1
+              exportSettings.LR_jpeg_useLimitSize = false
+              return LrPathUtils.removeExtension(renditionToSatisfy.destinationPath) .. '-' .. os.time() .. '-MOZJ.jpg'
+            end
 					else
 						outputToLog('Not modifying rendering, recompression not selected')
 					end
