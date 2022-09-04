@@ -44,6 +44,9 @@ outputToLog = function (msg)
 	logger:trace(msg)  -- Uncomment this line to enable logging
 end
 
+local maxConcurrentTasks = 4
+local jpegTasks = {}
+
 -- Define paths for external tools
 local UPexiv2 = 'exiv2'
 local UPImageMagick = 'ImageMagick'
@@ -100,218 +103,340 @@ ObserveJPEGXL_Recompress = function (propertyTable)
 	end
 end
 
-RecompressFile = function (functionContext, filterContext, sourceRendition, renditionToSatisfy)
-	local success, pathOrMessage = sourceRendition:waitForRender()
-	if success then
+local busy = false
 
-    if LrTasks.execute(UEImageMagick .. ' -version') == 0 then
-      UPImageMagick = UEImageMagick
+WaitFileWrite = function(entry)
+  if entry.fileWritten == true then
+    return true
+  end
+
+  local InFileAttr = LrFileUtils.fileAttributes(entry.input)
+  local size = InFileAttr['fileSize']
+  if size ~= nil then
+    if size > entry.lastSize then
+      outputToLog('File grew: ' .. entry.input .. ', ' .. entry.lastSize .. ' -> ' .. entry.size)
     end
 
-		if renditionToSatisfy.recompress then
-			local renderFileName = LrPathUtils.standardizePath(pathOrMessage) -- Rendered file
-			local ExpFileName = LrPathUtils.standardizePath(renditionToSatisfy.destinationPath) -- Final exported file
-			outputToLog('')
-			outputToLog('Lightroom render: ' .. renderFileName)
-      local InFileAttr =  LrFileUtils.fileAttributes(renderFileName)
-      if InFileAttr['fileSize'] ~= nil then
-        outputToLog('  ' .. renderFileName .. ': ' .. InFileAttr['fileSize'])
+    if size == 0 or entry.lastSize ~= size then
+      entry.lastChangeTime = os.time()
+      entry.lastSize = entry.size
+      entry.size = size
+    end
+  else
+    entry.lastChangeTime = os.time()
+  end
+
+  if entry.size ~= 0 and entry.size == entry.lastSize and os.time() - entry.lastChangeTime > 2 then
+    outputToLog('File written: ' .. entry.input .. ', ' .. entry.size)
+    entry.fileWritten = true
+    return true
+  else
+    return false
+  end
+end
+
+RecompressFileTask = function(entry)
+  outputToLog('Task: ' .. entry.input .. ' -> ' .. entry.output)
+
+  local renderFileName = LrPathUtils.standardizePath(entry.input) -- Rendered file
+  while not WaitFileWrite(entry) do
+    LrTasks.sleep(0.1)
+  end
+
+  local filterContext = entry.filterContext
+  
+  if LrTasks.execute(UEImageMagick .. ' -version') == 0 then
+    UPImageMagick = UEImageMagick
+  end
+
+  if entry.recompress then
+    local ExpFileName = LrPathUtils.standardizePath(entry.output) -- Final exported file
+    local InFileAttr =  LrFileUtils.fileAttributes(renderFileName)
+    if InFileAttr['fileSize'] ~= nil then
+      outputToLog('  ' .. renderFileName .. ': ' .. InFileAttr['fileSize'])
+    end
+
+    if filterContext.propertyTable.JPEGXL_Recompress then
+      local CmdRecompress = UPcjxl .. ' "' .. renderFileName .. '" "' .. ExpFileName .. '" -q 90 -e 9'
+      if filterContext.propertyTable.FTJO_Progressive then CmdRecompress = CmdRecompress .. ' -p' end
+      outputToLog('Recompress: ' .. CmdRecompress)
+      if LrTasks.execute(quote4Win(CmdRecompress)) ~= 0 then
+        LrFileUtils.delete(renderFileName)
+        LrFileUtils.delete(ExpFileName)
+        return 'Error recompressing JPEG XL file: ' .. CmdRecompress
       end
+      LrFileUtils.delete(renderFileName)
+    elseif filterContext.propertyTable.MOZJ_Recompress then
+      if not filterContext.propertyTable.FTJO_StripMetadata then
+        local CmdDumpMetadata = UPexiv2 .. ' -q -f -eX "' .. renderFileName .. '"'
+        outputToLog('Dump metadata: ' .. CmdDumpMetadata)
+        if LrTasks.execute(quote4Win(CmdDumpMetadata)) ~= 0 then
+          LrFileUtils.delete(renderFileName)
+          LrFileUtils.delete(LrPathUtils.replaceExtension(renderFileName, 'xmp'))
+          return 'Error exporting XMP data.'
+        end
+        LrFileUtils.move(LrPathUtils.replaceExtension(renderFileName, 'xmp'), LrPathUtils.replaceExtension(ExpFileName, 'xmp'))
 
-			if filterContext.propertyTable.JPEGXL_Recompress then
-				local CmdRecompress = UPcjxl .. ' "' .. renderFileName .. '" "' .. ExpFileName .. '" -q 90 -e 9'
-				if filterContext.propertyTable.FTJO_Progressive then CmdRecompress = CmdRecompress .. ' -p' end
-				outputToLog('Recompress: ' .. CmdRecompress)
-				if LrTasks.execute(quote4Win(CmdRecompress)) ~= 0 then
-					renditionToSatisfy:renditionIsDone(false, 'Error recompressing JPEG XL file: ' .. CmdRecompress)
-					LrFileUtils.delete(renderFileName)
-					LrFileUtils.delete(ExpFileName)
-					return false
-				end
-				LrFileUtils.delete(renderFileName)
-			elseif filterContext.propertyTable.MOZJ_Recompress then
-				if not filterContext.propertyTable.FTJO_StripMetadata then
-					local CmdDumpMetadata = UPexiv2 .. ' -q -f -eX "' .. renderFileName .. '"'
-					outputToLog('Dump metadata: ' .. CmdDumpMetadata)
-					if LrTasks.execute(quote4Win(CmdDumpMetadata)) ~= 0 then
-						renditionToSatisfy:renditionIsDone(false, 'Error exporting XMP data.')
-						LrFileUtils.delete(renderFileName)
-						LrFileUtils.delete(LrPathUtils.replaceExtension(renderFileName, 'xmp'))
-						return false
-					end
-					LrFileUtils.move(LrPathUtils.replaceExtension(renderFileName, 'xmp'), LrPathUtils.replaceExtension(ExpFileName, 'xmp'))
-
-					if not filterContext.propertyTable.FTJO_RemovePreview then
-						local CmdRenderPreview = UPImageMagick .. ' "' .. renderFileName .. '" -resize 256x256 ppm:- | ' .. UPjpegrecompress .. ' --quiet --no-progressive --method smallfry --quality low --strip --ppm - "' .. LrPathUtils.removeExtension(ExpFileName) .. '-thumb.jpg"'
-						outputToLog('Render preview: ' .. CmdRenderPreview)
-						if LrTasks.execute(quote4Win(CmdRenderPreview)) ~= 0 then
-							renditionToSatisfy:renditionIsDone(false, 'Error creating EXIF thumbnail.')
-							LrFileUtils.delete(renderFileName)
-							LrFileUtils.delete(LrPathUtils.replaceExtension(ExpFileName, 'xmp'))
-							LrFileUtils.delete(LrPathUtils.removeExtension(ExpFileName) ..'-thumb.jpg')
-							return false
-						end
-					end
-				end
-
-        if filterContext.propertyTable.MOZJ_UseTIFF then
-          local CmdCreatePNG = UPImageMagick .. ' convert "' .. renderFileName .. '" -define png:compression-level=0 -define png:compression-filter=0 -define png:compression-strategy=0 -colorspace sRGB "' .. renderFileName .. '.png"'
-          outputToLog('-> PNG: ' .. CmdCreatePNG)
-          if LrTasks.execute(quote4Win(CmdCreatePNG)) ~= 0 then
-            renditionToSatisfy:renditionIsDone(false, 'Error converting TIFF to PNG file.')
+        if not filterContext.propertyTable.FTJO_RemovePreview then
+          local CmdRenderPreview = UPImageMagick .. ' "' .. renderFileName .. '" -resize 256x256 ppm:- | ' .. UPjpegrecompress .. ' --quiet --no-progressive --method smallfry --quality low --strip --ppm - "' .. LrPathUtils.removeExtension(ExpFileName) .. '-thumb.jpg"'
+          outputToLog('Render preview: ' .. CmdRenderPreview)
+          if LrTasks.execute(quote4Win(CmdRenderPreview)) ~= 0 then
             LrFileUtils.delete(renderFileName)
-            LrFileUtils.delete(renderFileName .. '.png')
             LrFileUtils.delete(LrPathUtils.replaceExtension(ExpFileName, 'xmp'))
             LrFileUtils.delete(LrPathUtils.removeExtension(ExpFileName) ..'-thumb.jpg')
-            return false
+            return 'Error creating EXIF thumbnail.'
           end
-          local PNGAttr =  LrFileUtils.fileAttributes(renderFileName .. '.png')
-          if PNGAttr['fileSize'] ~= nil then
-            outputToLog('  ' .. renderFileName .. '.png: ' .. PNGAttr['fileSize'])
+        end
+      end
+
+      if filterContext.propertyTable.MOZJ_UseTIFF then
+        local CmdCreatePNG = UPImageMagick .. ' convert "' .. renderFileName .. '" -define png:compression-level=0 -define png:compression-filter=0 -define png:compression-strategy=0 -colorspace sRGB "' .. renderFileName .. '.png"'
+        outputToLog('-> PNG: ' .. CmdCreatePNG)
+        if LrTasks.execute(quote4Win(CmdCreatePNG)) ~= 0 then
+          LrFileUtils.delete(renderFileName)
+          LrFileUtils.delete(renderFileName .. '.png')
+          LrFileUtils.delete(LrPathUtils.replaceExtension(ExpFileName, 'xmp'))
+          LrFileUtils.delete(LrPathUtils.removeExtension(ExpFileName) ..'-thumb.jpg')
+          return 'Error converting TIFF to PNG file.'
+        end
+        local PNGAttr =  LrFileUtils.fileAttributes(renderFileName .. '.png')
+        if PNGAttr['fileSize'] ~= nil then
+          outputToLog('  ' .. renderFileName .. '.png: ' .. PNGAttr['fileSize'])
+        end
+        LrFileUtils.delete(renderFileName)
+        renderFileName = renderFileName .. '.png'
+      end
+
+      local CmdRecompress = UPcjpeg .. ' -outfile "' .. ExpFileName .. '"'
+      if not filterContext.propertyTable.FTJO_Progressive then CmdRecompress = CmdRecompress .. ' -baseline' end
+      CmdRecompress = CmdRecompress .. ' "' .. renderFileName
+      outputToLog('-> JPEG: ' .. CmdRecompress)
+      if LrTasks.execute(quote4Win(CmdRecompress)) ~= 0 then
+        LrFileUtils.delete(renderFileName)
+        LrFileUtils.delete(ExpFileName)
+        LrFileUtils.delete(LrPathUtils.replaceExtension(ExpFileName, 'xmp'))
+        LrFileUtils.delete(LrPathUtils.removeExtension(ExpFileName) ..'-thumb.jpg')
+        return 'Error creating MozJPEG JPEG file from PNG.'
+      end
+      LrFileUtils.delete(renderFileName)
+
+      if not filterContext.propertyTable.FTJO_StripMetadata then
+        local CmdInsertMetadata = UPexiv2 .. ' -q -f -iX "' .. ExpFileName .. '"' .. (MAC_ENV and ' 2>/dev/null' or ' 2>nul')
+        outputToLog('Insert metadata: ' .. CmdInsertMetadata)
+        if LrTasks.execute(quote4Win(CmdInsertMetadata)) ~= 0 then
+          LrFileUtils.delete(ExpFileName)
+          LrFileUtils.delete(LrPathUtils.replaceExtension(ExpFileName, 'xmp'))
+          LrFileUtils.delete(LrPathUtils.removeExtension(ExpFileName) ..'-thumb.jpg')
+          return 'Error importing XMP data.'
+        end
+        LrFileUtils.delete(LrPathUtils.replaceExtension(ExpFileName, 'xmp'))
+
+        if not filterContext.propertyTable.FTJO_RemovePreview then
+          local CmdInsertPreview = UPexiv2 .. ' -q -f -it "' .. ExpFileName .. '"'
+          outputToLog('Insert preview: ' .. CmdInsertPreview)
+          if LrTasks.execute(quote4Win(CmdInsertPreview)) ~= 0 then
+            LrFileUtils.delete(ExpFileName)
+            LrFileUtils.delete(LrPathUtils.removeExtension(ExpFileName) ..'-thumb.jpg')
+            return 'Error importing EXIF thumbnail.'
           end
-          LrFileUtils.delete(renderFileName)
-          renderFileName = renderFileName .. '.png'
+          LrFileUtils.delete(LrPathUtils.removeExtension(ExpFileName) ..'-thumb.jpg')
         end
-
-				local CmdRecompress = UPcjpeg .. ' -outfile "' .. ExpFileName .. '"'
-				if not filterContext.propertyTable.FTJO_Progressive then CmdRecompress = CmdRecompress .. ' -baseline' end
-				CmdRecompress = CmdRecompress .. ' "' .. renderFileName
-				outputToLog('-> JPEG: ' .. CmdRecompress)
-				if LrTasks.execute(quote4Win(CmdRecompress)) ~= 0 then
-					renditionToSatisfy:renditionIsDone(false, 'Error creating MozJPEG JPEG file from PNG.')
+      end
+      LrFileUtils.delete(renderFileName)
+      local ExpAttr =  LrFileUtils.fileAttributes(ExpFileName)
+      if ExpAttr['fileSize'] ~= nil then
+        outputToLog('  ' .. ExpFileName .. ': ' .. ExpAttr['fileSize'])
+      end
+    elseif filterContext.propertyTable.FTJO_Recompress then
+      if not filterContext.propertyTable.FTJO_StripMetadata then
+        local CmdDumpMetadata = UPexiv2 .. ' -q -f -eX "' .. renderFileName .. '"'
+        outputToLog('Dump metadata: ' .. CmdDumpMetadata)
+        if LrTasks.execute(quote4Win(CmdDumpMetadata)) ~= 0 then
           LrFileUtils.delete(renderFileName)
-					LrFileUtils.delete(ExpFileName)
-					LrFileUtils.delete(LrPathUtils.replaceExtension(ExpFileName, 'xmp'))
-					LrFileUtils.delete(LrPathUtils.removeExtension(ExpFileName) ..'-thumb.jpg')
-					return false
-				end
-				LrFileUtils.delete(renderFileName)
-
-				if not filterContext.propertyTable.FTJO_StripMetadata then
-					local CmdInsertMetadata = UPexiv2 .. ' -q -f -iX "' .. ExpFileName .. '"' .. (MAC_ENV and ' 2>/dev/null' or ' 2>nul')
-					outputToLog('Insert metadata: ' .. CmdInsertMetadata)
-					if LrTasks.execute(quote4Win(CmdInsertMetadata)) ~= 0 then
-						renditionToSatisfy:renditionIsDone(false, 'Error importing XMP data.')
-						LrFileUtils.delete(ExpFileName)
-						LrFileUtils.delete(LrPathUtils.replaceExtension(ExpFileName, 'xmp'))
-						LrFileUtils.delete(LrPathUtils.removeExtension(ExpFileName) ..'-thumb.jpg')
-						return false
-					end
-					LrFileUtils.delete(LrPathUtils.replaceExtension(ExpFileName, 'xmp'))
-
-					if not filterContext.propertyTable.FTJO_RemovePreview then
-						local CmdInsertPreview = UPexiv2 .. ' -q -f -it "' .. ExpFileName .. '"'
-						outputToLog('Insert preview: ' .. CmdInsertPreview)
-						if LrTasks.execute(quote4Win(CmdInsertPreview)) ~= 0 then
-							renditionToSatisfy:renditionIsDone(false, 'Error importing EXIF thumbnail.')
-							LrFileUtils.delete(ExpFileName)
-							LrFileUtils.delete(LrPathUtils.removeExtension(ExpFileName) ..'-thumb.jpg')
-							return false
-						end
-						LrFileUtils.delete(LrPathUtils.removeExtension(ExpFileName) ..'-thumb.jpg')
-					end
-				end
-				LrFileUtils.delete(renderFileName)
-        local ExpAttr =  LrFileUtils.fileAttributes(ExpFileName)
-        if ExpAttr['fileSize'] ~= nil then
-          outputToLog('  ' .. ExpFileName .. ': ' .. ExpAttr['fileSize'])
+          LrFileUtils.delete(LrPathUtils.replaceExtension(renderFileName, 'xmp'))
+          return 'Error exporting XMP data.'
         end
-			elseif filterContext.propertyTable.FTJO_Recompress then
-				if not filterContext.propertyTable.FTJO_StripMetadata then
-					local CmdDumpMetadata = UPexiv2 .. ' -q -f -eX "' .. renderFileName .. '"'
-					outputToLog('Dump metadata: ' .. CmdDumpMetadata)
-					if LrTasks.execute(quote4Win(CmdDumpMetadata)) ~= 0 then
-						renditionToSatisfy:renditionIsDone(false, 'Error exporting XMP data.')
-						LrFileUtils.delete(renderFileName)
-						LrFileUtils.delete(LrPathUtils.replaceExtension(renderFileName, 'xmp'))
-						return false
-					end
-					LrFileUtils.move(LrPathUtils.replaceExtension(renderFileName, 'xmp'), LrPathUtils.replaceExtension(ExpFileName, 'xmp'))
-					if not filterContext.propertyTable.FTJO_RemovePreview then
-						local CmdRenderPreview = UPImageMagick .. ' "' .. renderFileName .. '" -resize 256x256 ppm:- | ' .. UPjpegrecompress .. ' --quiet --no-progressive --method smallfry --quality low --strip --ppm - "' .. LrPathUtils.removeExtension(ExpFileName) .. '-thumb.jpg"'
-						outputToLog('Render preview: ' .. CmdRenderPreview)
-						if LrTasks.execute(quote4Win(CmdRenderPreview)) ~= 0 then
-							renditionToSatisfy:renditionIsDone(false, 'Error creating EXIF thumbnail.')
-							LrFileUtils.delete(renderFileName)
-							LrFileUtils.delete(LrPathUtils.replaceExtension(ExpFileName, 'xmp'))
-							LrFileUtils.delete(LrPathUtils.removeExtension(ExpFileName) ..'-thumb.jpg')
-							return false
-						end
-					end
-				end
+        LrFileUtils.move(LrPathUtils.replaceExtension(renderFileName, 'xmp'), LrPathUtils.replaceExtension(ExpFileName, 'xmp'))
+        if not filterContext.propertyTable.FTJO_RemovePreview then
+          local CmdRenderPreview = UPImageMagick .. ' "' .. renderFileName .. '" -resize 256x256 ppm:- | ' .. UPjpegrecompress .. ' --quiet --no-progressive --method smallfry --quality low --strip --ppm - "' .. LrPathUtils.removeExtension(ExpFileName) .. '-thumb.jpg"'
+          outputToLog('Render preview: ' .. CmdRenderPreview)
+          if LrTasks.execute(quote4Win(CmdRenderPreview)) ~= 0 then
+            LrFileUtils.delete(renderFileName)
+            LrFileUtils.delete(LrPathUtils.replaceExtension(ExpFileName, 'xmp'))
+            LrFileUtils.delete(LrPathUtils.removeExtension(ExpFileName) ..'-thumb.jpg')
+            return 'Error creating EXIF thumbnail.'
+          end
+        end
+      end
 
-				local CmdRecompress = UPImageMagick .. ' "' .. renderFileName .. '" ppm:- | ' .. UPjpegrecompress .. ' --quiet --accurate --method ' .. filterContext.propertyTable.FTJO_JRCMethod .. ' --quality ' .. filterContext.propertyTable.FTJO_JRCQuality .. ' --strip'
-				if not filterContext.propertyTable.FTJO_Progressive then CmdRecompress = CmdRecompress .. ' --no-progressive' end
-				if not filterContext.propertyTable.FTJO_JRCSubsampling then CmdRecompress = CmdRecompress .. ' --subsample disable' end
-				CmdRecompress = CmdRecompress .. ' --ppm - "' .. ExpFileName ..  '"'
-				outputToLog('Recompress: ' .. CmdRecompress)
-				if LrTasks.execute(quote4Win(CmdRecompress)) ~= 0 then
-					renditionToSatisfy:renditionIsDone(false, 'Error recompressing JPEG file.')
-					LrFileUtils.delete(renderFileName)
-					LrFileUtils.delete(ExpFileName)
-					LrFileUtils.delete(LrPathUtils.replaceExtension(ExpFileName, 'xmp'))
-					LrFileUtils.delete(LrPathUtils.removeExtension(ExpFileName) ..'-thumb.jpg')
-					return false
-				end
-				LrFileUtils.delete(renderFileName)
+      local CmdRecompress = UPImageMagick .. ' "' .. renderFileName .. '" ppm:- | ' .. UPjpegrecompress .. ' --quiet --accurate --method ' .. filterContext.propertyTable.FTJO_JRCMethod .. ' --quality ' .. filterContext.propertyTable.FTJO_JRCQuality .. ' --strip'
+      if not filterContext.propertyTable.FTJO_Progressive then CmdRecompress = CmdRecompress .. ' --no-progressive' end
+      if not filterContext.propertyTable.FTJO_JRCSubsampling then CmdRecompress = CmdRecompress .. ' --subsample disable' end
+      CmdRecompress = CmdRecompress .. ' --ppm - "' .. ExpFileName ..  '"'
+      outputToLog('Recompress: ' .. CmdRecompress)
+      if LrTasks.execute(quote4Win(CmdRecompress)) ~= 0 then
+        LrFileUtils.delete(renderFileName)
+        LrFileUtils.delete(ExpFileName)
+        LrFileUtils.delete(LrPathUtils.replaceExtension(ExpFileName, 'xmp'))
+        LrFileUtils.delete(LrPathUtils.removeExtension(ExpFileName) ..'-thumb.jpg')
+        return 'Error recompressing JPEG file.'
+      end
+      LrFileUtils.delete(renderFileName)
 
-				if not filterContext.propertyTable.FTJO_StripMetadata then
-					local CmdInsertMetadata = UPexiv2 .. ' -q -f -iX "' .. ExpFileName .. '"' .. (MAC_ENV and ' 2>/dev/null' or ' 2>nul')
-					outputToLog('Insert metadata: ' .. CmdInsertMetadata)
-					if LrTasks.execute(quote4Win(CmdInsertMetadata)) ~= 0 then
-						renditionToSatisfy:renditionIsDone(false, 'Error importing XMP data.')
-						LrFileUtils.delete(ExpFileName)
-						LrFileUtils.delete(LrPathUtils.replaceExtension(ExpFileName, 'xmp'))
-						LrFileUtils.delete(LrPathUtils.removeExtension(ExpFileName) ..'-thumb.jpg')
-						return false
-					end
-					LrFileUtils.delete(LrPathUtils.replaceExtension(ExpFileName, 'xmp'))
+      if not filterContext.propertyTable.FTJO_StripMetadata then
+        local CmdInsertMetadata = UPexiv2 .. ' -q -f -iX "' .. ExpFileName .. '"' .. (MAC_ENV and ' 2>/dev/null' or ' 2>nul')
+        outputToLog('Insert metadata: ' .. CmdInsertMetadata)
+        if LrTasks.execute(quote4Win(CmdInsertMetadata)) ~= 0 then
+          LrFileUtils.delete(ExpFileName)
+          LrFileUtils.delete(LrPathUtils.replaceExtension(ExpFileName, 'xmp'))
+          LrFileUtils.delete(LrPathUtils.removeExtension(ExpFileName) ..'-thumb.jpg')
+          return 'Error importing XMP data.'
+        end
+        LrFileUtils.delete(LrPathUtils.replaceExtension(ExpFileName, 'xmp'))
 
-					if not filterContext.propertyTable.FTJO_RemovePreview then
-						local CmdInsertPreview = UPexiv2 .. ' -q -f -it "' .. ExpFileName .. '"'
-						outputToLog('Insert preview: ' .. CmdInsertPreview)
-						if LrTasks.execute(quote4Win(CmdInsertPreview)) ~= 0 then
-							renditionToSatisfy:renditionIsDone(false, 'Error importing EXIF thumbnail.')
-							LrFileUtils.delete(ExpFileName)
-							LrFileUtils.delete(LrPathUtils.removeExtension(ExpFileName) ..'-thumb.jpg')
-							return false
-						end
-						LrFileUtils.delete(LrPathUtils.removeExtension(ExpFileName) ..'-thumb.jpg')
-					end
-				end
-				LrFileUtils.delete(renderFileName)
-			end
-		else
-			outputToLog('Not recompressing file: ' .. pathOrMessage)
-			if filterContext.propertyTable.LR_format ~= 'JPEG' then
-				if filterContext.propertyTable.FTJO_RemovePreview and not filterContext.propertyTable.FTJO_StripMetadata then
-					local CmdRemovePreview = UPexiv2 .. ' -q -f -dt "' .. ExpFileName .. '"'
-					outputToLog('Remove preview: ' .. CmdRemovePreview)
-					if LrTasks.execute(quote4Win(CmdRemovePreview)) ~= 0 then
-						renditionToSatisfy:renditionIsDone(false, 'Error removing EXIF thumbnail.')
-						LrFileUtils.delete(ExpFileName)
-						return false
-					end
-				end
+        if not filterContext.propertyTable.FTJO_RemovePreview then
+          local CmdInsertPreview = UPexiv2 .. ' -q -f -it "' .. ExpFileName .. '"'
+          outputToLog('Insert preview: ' .. CmdInsertPreview)
+          if LrTasks.execute(quote4Win(CmdInsertPreview)) ~= 0 then
+            LrFileUtils.delete(ExpFileName)
+            LrFileUtils.delete(LrPathUtils.removeExtension(ExpFileName) ..'-thumb.jpg')
+            return 'Error importing EXIF thumbnail.'
+          end
+          LrFileUtils.delete(LrPathUtils.removeExtension(ExpFileName) ..'-thumb.jpg')
+        end
+      end
+      LrFileUtils.delete(renderFileName)
+    end
+  else
+    outputToLog('Not recompressing file: ' .. entry.input)
+    if filterContext.propertyTable.LR_format ~= 'JPEG' then
+      if filterContext.propertyTable.FTJO_RemovePreview and not filterContext.propertyTable.FTJO_StripMetadata then
+        local CmdRemovePreview = UPexiv2 .. ' -q -f -dt "' .. ExpFileName .. '"'
+        outputToLog('Remove preview: ' .. CmdRemovePreview)
+        if LrTasks.execute(quote4Win(CmdRemovePreview)) ~= 0 then
+          LrFileUtils.delete(ExpFileName)
+          return 'Error removing EXIF thumbnail.'
+        end
+      end
 
-				local CmdOptimize = filterContext.propertyTable.FTJO_StripMetadata and UPjpegtran .. ' -copy none' or UPjpegtran .. ' -copy all'
-				if not filterContext.propertyTable.FTJO_Progressive then CmdOptimize = CmdOptimize .. ' -revert -optimize' end
-				CmdOptimize = CmdOptimize .. ' -outfile "' .. ExpFileName .. '" "' .. ExpFileName .. '"'
-				outputToLog('Optimize: ' .. CmdOptimize)
-				if LrTasks.execute(quote4Win(CmdOptimize)) ~= 0 then
-					renditionToSatisfy:renditionIsDone(false, 'Error optimizing JPEG file.')
-					LrFileUtils.delete(ExpFileName)
-					return false
-				end
-			end
-		end
-    renditionToSatisfy:renditionIsDone(true)
-	else
-		renditionToSatisfy:renditionIsDone(false, pathOrMessage)
-		return false
-	end
-	
+      local CmdOptimize = filterContext.propertyTable.FTJO_StripMetadata and UPjpegtran .. ' -copy none' or UPjpegtran .. ' -copy all'
+      if not filterContext.propertyTable.FTJO_Progressive then CmdOptimize = CmdOptimize .. ' -revert -optimize' end
+      CmdOptimize = CmdOptimize .. ' -outfile "' .. ExpFileName .. '" "' .. ExpFileName .. '"'
+      outputToLog('Optimize: ' .. CmdOptimize)
+      if LrTasks.execute(quote4Win(CmdOptimize)) ~= 0 then
+        LrFileUtils.delete(ExpFileName)
+        return 'Error optimizing JPEG file.'
+      end
+    end
+  end
+
 	return true
+end
+
+Process = function (functionContext, filterContext, sourceRendition, renditionToSatisfy)
+	local success, pathOrMessage = sourceRendition:waitForRender()
+	if not success then
+    for i, entry in ipairs(jpegTasks) do
+      if entry.output == renditionToSatisfy.destinationPath then
+        entry.started = true
+        entry.done = true
+        if pathOrMessage == nil then
+          entry.result = "Lightroom failed to render image."
+        else
+          entry.result = pathOrMessage
+        end
+      end
+    end
+    renditionToSatisfy:renditionIsDone(false, pathOrMessage)
+    return false
+  end
+
+  local allDone = false
+  local processedAny = false
+  local requestedDone = false
+  while not requestedDone do
+    allDone = true
+    local processingCount = 0
+    for i, entry in ipairs(jpegTasks) do
+      -- Determine if all tasks are done, mark every time we find one that is
+      -- not done.
+      if not entry.done then
+        allDone = false
+      end
+
+      if not entry.started then
+        if entry.output == renditionToSatisfy.destinationPath then
+          -- This is the file we were called to process.  We know it is done
+          -- and don't need to determine if it is.
+          WaitFileWrite(entry) -- Call anyway to update size.
+          entry.fileWritten = true
+        else
+          WaitFileWrite(entry)
+        end
+      elseif entry.done then
+        if entry.output == renditionToSatisfy.destinationPath then
+          requestedDone = true
+        end
+      end
+
+      if entry.started and not entry.done then
+        processingCount = processingCount + 1
+      end
+    end
+    
+    if not allDone and processingCount < maxConcurrentTasks then
+      -- Try to queue more tasks if we aren't at max concurrency yet.
+      for i, entry in ipairs(jpegTasks) do
+        if not entry.started and entry.fileWritten and processingCount < maxConcurrentTasks then
+          -- Only process if hasn't been started and nothing has been written.
+          processedAny = true
+          processingCount = processingCount + 1
+          entry.started = true
+
+          LrTasks.startAsyncTask(
+            function() 
+              entry.startTime = os.time()
+              entry.result = RecompressFileTask(entry)
+              entry.done = true
+              entry.endTime = os.time()
+
+              if entry.result == true then
+                outputToLog('Task success: ' .. entry.input .. ' -> ' .. entry.output .. ', time: ' .. (entry.endTime - entry.startTime) .. ' seconds')
+              else
+                outputToLog('Task failed: ' .. entry.result .. ', ' .. entry.input .. ' -> ' .. entry.output .. ', time: ' .. (entry.endTime - entry.startTime) .. ' seconds')
+              end
+            end, 
+            'RecompressFileTask:' .. i .. ':' .. entry.input .. ':' .. entry.output)
+        end
+      end
+    end
+    
+    LrTasks.sleep(0.1)
+  end
+
+  for i, entry in ipairs(jpegTasks) do
+    if entry.output == renditionToSatisfy.destinationPath then
+      if not entry.done or entry.result == nil then
+        outputToLog('Rendition is done, failure: Task should be complete but is not, ' .. entry.input .. ' -> ' .. entry.output )
+        renditionToSatisfy:renditionIsDone(false, 'Task should be complete but is not.')
+        return false
+      end
+      
+      if entry.result == true then
+        outputToLog('Rendition is done, success: ' .. entry.input .. ' -> ' .. entry.output)
+        renditionToSatisfy:renditionIsDone(true)
+        return true
+      end
+
+      outputToLog('Rendition is done, failure: ' .. entry.result .. ', ' .. entry.input .. ' -> ' .. entry.output )
+      renditionToSatisfy:renditionIsDone(false, entry.result)
+      return false
+    end
+  end
+
+  outputToLog('Rendition is done, failure: Failed to find task in task table, ' .. entry.input .. ' -> ' .. entry.output )
+  renditionToSatisfy:renditionIsDone(false, 'Failed to find task in task table.')
+  return false
 end
 
 return {
@@ -489,6 +614,19 @@ return {
 			filterSettings = function( renditionToSatisfy, exportSettings )
 				outputToLog('Final output file: ' .. renditionToSatisfy.destinationPath)
 				renditionToSatisfy.recompress = false
+        entry = {
+          started = false,
+          done = false,
+          result = nil,
+          output = renditionToSatisfy.destinationPath,
+          filterContext = filterContext,
+          startTime = nil,
+          endTime = nil,
+          size = 0,
+          lastSize = 0,
+          lastChangeTime = 0,
+          fileWritten = false
+        }
 
 				if renditionToSatisfy.destinationPath:match('\.[Jj][Pp][Gg]$') then
 					if filterContext.propertyTable.JPEGXL_Recompress then
@@ -497,7 +635,7 @@ return {
 						exportSettings.LR_format = 'PNG'
 						exportSettings.LR_export_colorSpace = 'sRGB'
 						exportSettings.LR_export_bitDepth = 16
-						return LrPathUtils.removeExtension(renditionToSatisfy.destinationPath) .. '-' .. os.time() .. '-JPEGXL.png'
+						entry.input = LrPathUtils.removeExtension(renditionToSatisfy.destinationPath) .. '-' .. os.time() .. '-JPEGXL.png'
 					elseif filterContext.propertyTable.FTJO_Recompress then
 						outputToLog('Rendering TIFF sRGB 8bpp')
 						renditionToSatisfy.recompress = true
@@ -505,7 +643,7 @@ return {
 						exportSettings.LR_export_colorSpace = 'sRGB'
 						exportSettings.LR_export_bitDepth = 8
             exportSettings.LR_tiff_compressionMethod = 'compressionMethod_None'
-						return LrPathUtils.removeExtension(renditionToSatisfy.destinationPath) .. '-' .. os.time() .. '-FTJO.tif'
+						entry.input = LrPathUtils.removeExtension(renditionToSatisfy.destinationPath) .. '-' .. os.time() .. '-FTJO.tif'
 					elseif filterContext.propertyTable.MOZJ_Recompress then
 						renditionToSatisfy.recompress = true
             if filterContext.propertyTable.MOZJ_UseTIFF then
@@ -514,7 +652,7 @@ return {
               exportSettings.LR_export_colorSpace = 'sRGB'
               exportSettings.LR_export_bitDepth = 8
               exportSettings.LR_tiff_compressionMethod = 'compressionMethod_None'
-              return LrPathUtils.removeExtension(renditionToSatisfy.destinationPath) .. '-' .. os.time() .. '-MOZJ.tif'
+              entry.input = LrPathUtils.removeExtension(renditionToSatisfy.destinationPath) .. '-' .. os.time() .. '-MOZJ.tif'
             else
               outputToLog('Rendering JPEG sRGB 8bpp for MozJPEG')
               exportSettings.LR_format = 'JPEG'
@@ -522,23 +660,42 @@ return {
               exportSettings.LR_export_bitDepth = 8
               exportSettings.LR_jpeg_quality = 1
               exportSettings.LR_jpeg_useLimitSize = false
-              return LrPathUtils.removeExtension(renditionToSatisfy.destinationPath) .. '-' .. os.time() .. '-MOZJ.jpg'
+              entry.input = LrPathUtils.removeExtension(renditionToSatisfy.destinationPath) .. '-' .. os.time() .. '-MOZJ.jpg'
             end
 					else
 						outputToLog('Not modifying rendering, recompression not selected')
+            return
 					end
 				else
 					outputToLog('Not modifying rendering, output isn\'t JPEG')
+          return
 				end
+
+        entry.recompress = renditionToSatisfy.recompress
+        table.insert(jpegTasks, entry)
+        return entry.input
 			end,
 		}
-
+    
+    local count = 0
+    local startTime = os.time()
 		for sourceRendition, renditionToSatisfy in filterContext:renditions(renditionOptions) do
-			if RecompressFile(functionContext, filterContext, sourceRendition, renditionToSatisfy) then
-				outputToLog('Successfully exported file: ' .. renditionToSatisfy.destinationPath)
-			else
-				outputToLog('Failed exporting file: ' .. renditionToSatisfy.destinationPath)
-			end
+      if busy then
+        renditionToSatisfy:renditionIsDone(false, 'Can only process one set of exports at a time.')
+      else
+        busy = true
+        count = count + 1
+
+        if Process(functionContext, filterContext, sourceRendition, renditionToSatisfy) then
+          outputToLog('Successfully exported file: ' .. renditionToSatisfy.destinationPath)
+        else
+          outputToLog('Failed exporting file: ' .. renditionToSatisfy.destinationPath)
+        end
+        
+        busy = false
+      end
 		end
+    local endTime = os.time()
+    outputToLog('Processed: ' .. count .. ' in: ' .. (endTime - startTime) .. 's')
 	end
 }
